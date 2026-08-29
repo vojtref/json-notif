@@ -3,8 +3,11 @@
 import argparse
 import base64
 import json
+import os
 import signal
+import struct
 import sys
+import zlib
 
 import dbus
 import dbus.service
@@ -16,39 +19,34 @@ BUS_NAME = "org.freedesktop.Notifications"
 OBJECT_PATH = "/org/freedesktop/Notifications"
 INTERFACE = "org.freedesktop.Notifications"
 
-CAPABILITIES_DEF_ON = (
-	"body",
+IMAGE_DATA_HINTS = ("image-data", "image_data", "icon_data")
+
+CAPABILITIES = (
+	("body", True),
+	("body-markup", False),
+	("body-hyperlinks", False),
+	("body-images", False),
+	("icon-static", False),
+	("actions", False),
+	("action-icons", False),
+	("persistence", False),
+	("sound", False),
 )
 
-CAPABILITIES_DEF_OFF = (
-	"body-markup",
-	"body-hyperlinks",
-	"body-images",
-	"icon-static",
-	"actions",
-	"action-icons",
-	"persistence",
-	"sound",
-)
 
 def parse_args(argv=None):
 	parser = argparse.ArgumentParser(
 		description="Emit desktop notification events as NDJSON"
 	)
-	for capability in CAPABILITIES_DEF_ON:
+
+	for (capability, default) in CAPABILITIES:
 		parser.add_argument(
 			f"--{capability}",
 			action=argparse.BooleanOptionalAction,
-			default=True,
-			help=f"promise {capability} support (default: disabled)",
+			default=default,
+			help=f"promise {capability} support (default: {"enabled" if default else "disabled"})",
 		)
-	for capability in CAPABILITIES_DEF_OFF:
-		parser.add_argument(
-			f"--{capability}",
-			action=argparse.BooleanOptionalAction,
-			default=False,
-			help=f"promise {capability} support (default: disabled)",
-		)
+
 	return parser.parse_args(argv)
 
 
@@ -58,7 +56,7 @@ def enabled_capabilities(args):
 		capabilities.append("body")
 	capabilities.extend(
 		capability
-		for capability in CAPABILITIES
+		for capability, _ in CAPABILITIES
 		if getattr(args, capability.replace("-", "_"))
 	)
 	return capabilities
@@ -66,6 +64,11 @@ def enabled_capabilities(args):
 
 def json_value(value):
 	if isinstance(value, (dbus.ByteArray, bytes, bytearray)):
+		return {
+			"encoding": "base64",
+			"data": base64.b64encode(bytes(value)).decode("ascii"),
+		}
+	if isinstance(value, dbus.Array) and value.signature == dbus.Signature("y"):
 		return {
 			"encoding": "base64",
 			"data": base64.b64encode(bytes(value)).decode("ascii"),
@@ -89,13 +92,91 @@ def emit(event):
 	print(json.dumps(event, separators=(",", ":")), flush=True)
 
 
+def image_directory_path():
+	runtime_directory = os.environ.get("XDG_RUNTIME_DIR")
+	if not runtime_directory:
+		raise RuntimeError("XDG_RUNTIME_DIR is not set")
+	return os.path.join(runtime_directory, "json-notif")
+
+
+def prepare_image_directory(image_directory):
+	os.makedirs(image_directory, mode=0o700, exist_ok=True)
+	os.chmod(image_directory, 0o700)
+
+	for entry in os.scandir(image_directory):
+		if entry.name.endswith((".png", ".png.tmp")):
+			os.unlink(entry.path)
+
+
+def png_chunk(chunk_type, data):
+	return (
+		struct.pack(">I", len(data))
+		+ chunk_type
+		+ data
+		+ struct.pack(">I", zlib.crc32(chunk_type + data) & 0xFFFFFFFF)
+	)
+
+
+def encode_png(image_data):
+	if len(image_data) != 7:
+		raise ValueError("image data must contain seven fields")
+
+	width, height, rowstride, has_alpha, bits_per_sample, channels, data = (
+		image_data
+	)
+	width = int(width)
+	height = int(height)
+	rowstride = int(rowstride)
+	has_alpha = bool(has_alpha)
+	bits_per_sample = int(bits_per_sample)
+	channels = int(channels)
+	data = bytes(data)
+
+	if not 0 < width <= 0xFFFFFFFF or not 0 < height <= 0xFFFFFFFF:
+		raise ValueError("invalid image dimensions")
+	if bits_per_sample != 8:
+		raise ValueError("only 8-bit image data is supported")
+	if channels != (4 if has_alpha else 3):
+		raise ValueError("image alpha flag and channel count disagree")
+
+	packed_rowstride = width * channels
+	if rowstride < packed_rowstride:
+		raise ValueError("image rowstride is too small")
+	if len(data) < rowstride * height:
+		raise ValueError("image byte array is truncated")
+
+	scanlines = b"".join(
+		b"\0" + data[offset : offset + packed_rowstride]
+		for offset in range(0, rowstride * height, rowstride)
+	)
+	header = struct.pack(
+		">IIBBBBB",
+		width,
+		height,
+		bits_per_sample,
+		6 if has_alpha else 2,
+		0,
+		0,
+		0,
+	)
+	png = (
+		b"\x89PNG\r\n\x1a\n"
+		+ png_chunk(b"IHDR", header)
+		+ png_chunk(b"IDAT", zlib.compress(scanlines))
+		+ png_chunk(b"IEND", b"")
+	)
+	return png, width, height
+
+
 class NotificationService(dbus.service.Object):
-	def __init__(self, bus, capabilities):
+	def __init__(self, bus, capabilities, image_directory):
 		self._bus_name = dbus.service.BusName(
 			BUS_NAME, bus=bus, do_not_queue=True
 		)
 		super().__init__(self._bus_name, OBJECT_PATH)
 		self._capabilities = tuple(capabilities)
+		self._image_directory = image_directory
+		self._image_paths = {}
 		self._next_id = 1
 		self._active = set()
 
@@ -105,6 +186,62 @@ class NotificationService(dbus.service.Object):
 		notification_id = self._next_id
 		self._next_id = self._next_id % 0xFFFFFFFF + 1
 		return notification_id
+
+	def _remove_images(self, notification_id):
+		for path in self._image_paths.pop(notification_id, ()):
+			try:
+				os.unlink(path)
+			except FileNotFoundError:
+				pass
+
+	def cleanup(self):
+		for notification_id in tuple(self._image_paths):
+			self._remove_images(notification_id)
+
+	def _externalize_image(self, notification_id, hint_name, image_data):
+		png, width, height = encode_png(image_data)
+		filename = f"{notification_id}-{hint_name}.png"
+		path = os.path.join(self._image_directory, filename)
+		temporary_path = f"{path}.tmp"
+
+		try:
+			descriptor = os.open(
+				temporary_path,
+				os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+				0o600,
+			)
+			with os.fdopen(descriptor, "wb") as image_file:
+				image_file.write(png)
+			os.replace(temporary_path, path)
+		except Exception:
+			try:
+				os.unlink(temporary_path)
+			except FileNotFoundError:
+				pass
+			raise
+
+		self._image_paths.setdefault(notification_id, set()).add(path)
+		return {
+			"path": path,
+			"mime_type": "image/png",
+			"width": width,
+			"height": height,
+		}
+
+	def _json_hints(self, notification_id, hints):
+		result = {}
+		for key, value in hints.items():
+			key = str(key)
+			if key in IMAGE_DATA_HINTS:
+				try:
+					result[key] = self._externalize_image(
+						notification_id, key, value
+					)
+				except (OSError, TypeError, ValueError) as error:
+					result[key] = {"error": str(error)}
+			else:
+				result[key] = json_value(value)
+		return result
 
 	@dbus.service.method(INTERFACE, in_signature="", out_signature="as")
 	def GetCapabilities(self):
@@ -132,6 +269,7 @@ class NotificationService(dbus.service.Object):
 		else:
 			notification_id = self._allocate_id()
 
+		self._remove_images(notification_id)
 		self._active.add(notification_id)
 		emit(
 			{
@@ -143,7 +281,7 @@ class NotificationService(dbus.service.Object):
 				"summary": str(summary),
 				"body": str(body),
 				"actions": [str(item) for item in actions],
-				"hints": json_value(hints),
+				"hints": self._json_hints(notification_id, hints),
 				"expire_timeout": int(expire_timeout),
 			}
 		)
@@ -153,13 +291,14 @@ class NotificationService(dbus.service.Object):
 	def CloseNotification(self, notification_id):
 		notification_id = int(notification_id)
 		emit({"event": "close", "id": notification_id})
+		self._remove_images(notification_id)
 		if notification_id in self._active:
 			self._active.remove(notification_id)
 			self.NotificationClosed(notification_id, 3)
 
 	@dbus.service.method(INTERFACE, in_signature="", out_signature="ssss")
 	def GetServerInformation(self):
-		return ("json-notif", "local", "0.1", "1.2")
+		return ("json-notif", "local", "0.2", "1.2")
 
 	@dbus.service.signal(INTERFACE, signature="uu")
 	def NotificationClosed(self, notification_id, reason):
@@ -177,12 +316,27 @@ def main():
 	bus = dbus.SessionBus()
 
 	try:
-		service = NotificationService(bus, enabled_capabilities(args))
+		image_directory = image_directory_path()
+	except RuntimeError as error:
+		print(f"json-notif: {error}", file=sys.stderr)
+		return 1
+
+	try:
+		service = NotificationService(
+			bus, enabled_capabilities(args), image_directory
+		)
 	except dbus.exceptions.NameExistsException:
 		print(
 			f"{BUS_NAME} is already owned by another notification daemon",
 			file=sys.stderr,
 		)
+		return 1
+
+	try:
+		prepare_image_directory(image_directory)
+	except OSError as error:
+		print(f"json-notif: {error}", file=sys.stderr)
+		del service
 		return 1
 
 	loop = GLib.MainLoop()
@@ -192,7 +346,14 @@ def main():
 
 	signal.signal(signal.SIGINT, stop)
 	signal.signal(signal.SIGTERM, stop)
-	loop.run()
+	try:
+		loop.run()
+	finally:
+		service.cleanup()
+		try:
+			os.rmdir(image_directory)
+		except OSError:
+			pass
 	del service
 	return 0
 
