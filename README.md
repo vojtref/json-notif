@@ -6,6 +6,8 @@ Intended for use with status bar software like [Eww](https://github.com/elkowar/
 
 ## AI disclosure
 
-This piece of software was written with significant use of OpenAI ChatGPT. [REAL rating level](https://www.realgoodai.org/real-rating): **4**.
+[![REAL rating: 4](/real-rating-4.png)](https://www.realgoodai.org/real-rating)
+
+This piece of software was written with significant use of OpenAI ChatGPT.
 
 All code has been verified and tested by a human, with many human-authored direct modifications. However, per the MIT license, there are no safety nor correctness guarantees.
