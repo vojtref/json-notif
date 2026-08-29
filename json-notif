@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import argparse
 import base64
 import json
 import signal
@@ -14,6 +15,53 @@ from gi.repository import GLib
 BUS_NAME = "org.freedesktop.Notifications"
 OBJECT_PATH = "/org/freedesktop/Notifications"
 INTERFACE = "org.freedesktop.Notifications"
+
+CAPABILITIES_DEF_ON = (
+	"body",
+)
+
+CAPABILITIES_DEF_OFF = (
+	"body-markup",
+	"body-hyperlinks",
+	"body-images",
+	"icon-static",
+	"actions",
+	"action-icons",
+	"persistence",
+	"sound",
+)
+
+def parse_args(argv=None):
+	parser = argparse.ArgumentParser(
+		description="Emit desktop notification events as NDJSON"
+	)
+	for capability in CAPABILITIES_DEF_ON:
+		parser.add_argument(
+			f"--{capability}",
+			action=argparse.BooleanOptionalAction,
+			default=True,
+			help=f"promise {capability} support (default: disabled)",
+		)
+	for capability in CAPABILITIES_DEF_OFF:
+		parser.add_argument(
+			f"--{capability}",
+			action=argparse.BooleanOptionalAction,
+			default=False,
+			help=f"promise {capability} support (default: disabled)",
+		)
+	return parser.parse_args(argv)
+
+
+def enabled_capabilities(args):
+	capabilities = []
+	if args.body:
+		capabilities.append("body")
+	capabilities.extend(
+		capability
+		for capability in CAPABILITIES
+		if getattr(args, capability.replace("-", "_"))
+	)
+	return capabilities
 
 
 def json_value(value):
@@ -42,11 +90,12 @@ def emit(event):
 
 
 class NotificationService(dbus.service.Object):
-	def __init__(self, bus):
+	def __init__(self, bus, capabilities):
 		self._bus_name = dbus.service.BusName(
 			BUS_NAME, bus=bus, do_not_queue=True
 		)
 		super().__init__(self._bus_name, OBJECT_PATH)
+		self._capabilities = tuple(capabilities)
 		self._next_id = 1
 		self._active = set()
 
@@ -59,7 +108,7 @@ class NotificationService(dbus.service.Object):
 
 	@dbus.service.method(INTERFACE, in_signature="", out_signature="as")
 	def GetCapabilities(self):
-		return ["body"]
+		return list(self._capabilities)
 
 	@dbus.service.method(
 		INTERFACE,
@@ -122,12 +171,13 @@ class NotificationService(dbus.service.Object):
 
 
 def main():
+	args = parse_args()
 	signal.signal(signal.SIGPIPE, signal.SIG_DFL)
 	DBusGMainLoop(set_as_default=True)
 	bus = dbus.SessionBus()
 
 	try:
-		service = NotificationService(bus)
+		service = NotificationService(bus, enabled_capabilities(args))
 	except dbus.exceptions.NameExistsException:
 		print(
 			f"{BUS_NAME} is already owned by another notification daemon",
